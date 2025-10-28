@@ -24,16 +24,8 @@ git add package.json yarn.lock
 git commit -m "Add react-scripts to dependencies"
 git push
 {
-  "builds": [
-    {
-      "src": "package.json",
-      "use": "@vercel/static-build",
-      "config": {
-        "installCommand": "npm install --production=false"
-      }
-    }
-  ]
-}
+  
+
     "lucide-react": "^0.263.1",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
