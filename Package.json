@@ -12,10 +12,6 @@
     "build": "react-scripts build",
     "start": "react-scripts start"
   }
-
-yarn add react-scripts@5.0.1
-  
-{
   "scripts": {
     "build": "react-scripts build"
   }
