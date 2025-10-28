@@ -2,12 +2,17 @@
   "name": "quizusapp",
   "version": "0.1.0",
   "private": true,
+  {
   "dependencies": {
-  "react": "^18.0.0",
-    "react-dom": "^18.0.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
     "react-scripts": "5.0.1"
+  },
+  "scripts": {
+    "build": "react-scripts build",
+    "start": "react-scripts start"
   }
-} 
+
 yarn add react-scripts@5.0.1
 {
   "scripts": {
@@ -17,7 +22,17 @@ yarn add react-scripts@5.0.1
 git add package.json yarn.lock
 git commit -m "Add react-scripts to dependencies"
 git push
-
+{
+  "builds": [
+    {
+      "src": "package.json",
+      "use": "@vercel/static-build",
+      "config": {
+        "installCommand": "npm install --production=false"
+      }
+    }
+  ]
+}
     "lucide-react": "^0.263.1",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
