@@ -1,0 +1,1103 @@
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import { Map, Landmark, Crown, Vote, X, Check, Globe, RefreshCw, Zap, Target, BarChart4, Lock, StopCircle, Flag, BookOpen, Clock } from 'lucide-react';
+
+// --- CONFIGURATION ---
+const APP_ICON_URL = "image.jpeg";
+
+// --- API CONFIGURATION AND UTILITIES ---
+
+const GROK_MODEL = 'grok-4-fast-reasoning';
+const apiKey = ""; // Obtain from https://console.x.ai (xAI console)
+const TEXT_API_URL = `https://api.x.ai/v1/chat/completions`;
+
+/**
+ * Fetches content from the Grok API with web search enabled for grounding.
+ */
+const fetchGroundedFact = async (prompt) => {
+    const systemPrompt = "You are a helpful and knowledgeable tutor for a U.S. History and Geography quiz. Based on the user's question, provide one single, concise, and fun fact. The fact must be verifiable and sourced. Do not use markdown (like bolding or lists) in the final fact text. Do not start with phrases like 'Fun fact: ' or 'Did you know...'.";
+
+    const payload = {
+        model: GROK_MODEL,
+        messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: prompt }
+        ],
+        tools: ["web_search"], // Enables live web search for grounding
+    };
+
+    const MAX_RETRIES = 5;
+    for (let i = 0; i < MAX_RETRIES; i++) {
+        try {
+            const response = await fetch(TEXT_API_URL, {
+                method: 'POST',
+                headers: { 
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${apiKey}`
+                },
+                body: JSON.stringify(payload)
+            });
+
+            if (!response.ok) {
+                if (response.status === 429 && i < MAX_RETRIES - 1) {
+                    console.warn(`Rate limit hit (429). Retrying in ${Math.pow(2, i)}s...`);
+                } else {
+                    throw new Error(`API call failed with status: ${response.status}`);
+                }
+            } else {
+                const result = await response.json();
+                const choice = result.choices?.[0];
+
+                if (choice && choice.message?.content) {
+                    const text = choice.message.content;
+                    let sources = [];
+                    if (result.citations) {
+                        sources = result.citations
+                            .map(uri => ({
+                                uri,
+                                title: uri // Grok provides URLs; use URL as title if no explicit title
+                            }))
+                            .filter(source => source.uri)
+                            .slice(0, 3);
+                    }
+
+                    return { text, sources };
+
+                } else {
+                    console.error("Grok API response structure error:", result);
+                    return { text: "No specific fact found.", sources: [] };
+                }
+            }
+        } catch (error) {
+            console.error(`Attempt ${i + 1} failed:`, error);
+            if (i === MAX_RETRIES - 1) {
+                return { text: "Sorry, I couldn't fetch a fun fact right now.", sources: [] };
+            }
+        }
+        await new Promise(resolve => setTimeout(resolve, Math.pow(2, i) * 1000));
+    }
+};
+
+
+// --- SOUND UTILITIES (Web Audio API - for UI feedback) ---
+
+const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+
+/**
+ * NEW: Plays a distinct, higher-pitched dual-tone success sound.
+ */
+const playTriumphSound = () => {
+    const now = audioContext.currentTime;
+    const duration = 0.5;
+
+    // Oscillator 1: High pitch (Triangle wave)
+    const osc1 = audioContext.createOscillator();
+    const gain1 = audioContext.createGain();
+    osc1.type = 'triangle';
+    osc1.frequency.setValueAtTime(1200, now);
+    osc1.frequency.linearRampToValueAtTime(1800, now + duration);
+
+    // Oscillator 2: Lower pitch for depth (Square wave)
+    const osc2 = audioContext.createOscillator();
+    const gain2 = audioContext.createGain();
+    osc2.type = 'square';
+    osc2.frequency.setValueAtTime(600, now);
+    osc2.frequency.linearRampToValueAtTime(900, now + duration);
+
+    // Master Gain (increased volume for prominence)
+    const masterGain = audioContext.createGain();
+    masterGain.gain.setValueAtTime(0, now);
+    masterGain.gain.linearRampToValueAtTime(0.7, now + 0.05);
+    masterGain.gain.linearRampToValueAtTime(0, now + duration);
+
+    osc1.connect(gain1).connect(masterGain);
+    osc2.connect(gain2).connect(masterGain);
+    masterGain.connect(audioContext.destination);
+
+    osc1.start(now);
+    osc2.start(now);
+    osc1.stop(now + duration);
+    osc2.stop(now + duration);
+};
+
+// Sharper ticking sound function (unchanged)
+const playSingleTick = () => {
+    const now = audioContext.currentTime;
+    const oscillator = audioContext.createOscillator();
+    const gainNode = audioContext.createGain();
+
+    // Sharp, metallic tick sound (sawtooth wave)
+    oscillator.type = 'sawtooth';
+    oscillator.frequency.setValueAtTime(1000, now);
+    oscillator.frequency.exponentialRampToValueAtTime(300, now + 0.1);
+
+    // Quick volume spike for a click effect
+    gainNode.gain.setValueAtTime(0, now);
+    gainNode.gain.linearRampToValueAtTime(0.3, now + 0.001);
+    gainNode.gain.exponentialRampToValueAtTime(0.0001, now + 0.1);
+
+    oscillator.connect(gainNode);
+    gainNode.connect(audioContext.destination);
+
+    oscillator.start(now);
+    oscillator.stop(now + 0.1);
+};
+
+
+// --- CUSTOM HOOKS ---
+
+// Hook updated to manage the ticking sound interval directly.
+const useTimer = (initialTime, isLocked, isAudioUnlocked) => {
+    const [timeLeft, setTimeLeft] = useState(initialTime);
+    const intervalRef = useRef(null);
+
+    useEffect(() => {
+        if (isLocked) {
+            if (intervalRef.current) clearInterval(intervalRef.current);
+            return;
+        }
+
+        setTimeLeft(initialTime);
+
+        // Clear any existing interval
+        if (intervalRef.current) clearInterval(intervalRef.current);
+
+        // Start the timer and ticking interval
+        const timerId = setInterval(() => {
+            setTimeLeft(prevTime => {
+                const newTime = prevTime - 1;
+
+                // Play tick sound if audio is unlocked and time is remaining
+                if (newTime >= 1 && isAudioUnlocked) {
+                    playSingleTick();
+                }
+
+                if (newTime <= 0) {
+                    clearInterval(timerId);
+                    return 0;
+                }
+                return newTime;
+            });
+        }, 1000);
+
+        intervalRef.current = timerId;
+
+        // Cleanup function for when the component unmounts or dependencies change
+        return () => {
+            if (intervalRef.current) clearInterval(intervalRef.current);
+        };
+    }, [initialTime, isLocked, isAudioUnlocked]);
+
+    return timeLeft;
+};
+
+const useGrokFact = (questionText, isAnswered) => {
+    const [fact, setFact] = useState(null);
+    const [isLoading, setIsLoading] = useState(false);
+
+    useEffect(() => {
+        if (isAnswered && !fact) {
+            setIsLoading(true);
+            setFact(null);
+
+            const prompt = `Provide a fun fact based on the following quiz question: "${questionText}"`;
+            fetchGroundedFact(prompt)
+                .then(result => {
+                    setFact(result);
+                })
+                .catch(error => {
+                    console.error("Error fetching AI fact:", error);
+                    setFact({ text: "Could not retrieve a fun fact.", sources: [] });
+                })
+                .finally(() => {
+                    setIsLoading(false);
+                });
+        }
+    }, [isAnswered, questionText]); // eslint-disable-line react-hooks/exhaustive-deps
+
+    return { fact, isLoading };
+};
+
+
+// --- DATA: QUIZ QUESTIONS --- 
+
+const PRESIDENT_IMAGE = "https://www.shutterstock.com/shutterstock/videos/3706032735/thumb/1.jpg?ip=x480";
+const STATE_IMAGE = "https://media.gettyimages.com/id/1305909776/vector/usa-states-map-watercolor-and-pen-illustration-with-state-names-vector-eps10-illustration.jpg?s=612x612&w=gi&k=20&c=drZqhR9qMsNqgaNyQpn7WjNW1bGuoFb72Znw5Q6Wq5Y=";
+const ELECTION_IMAGE = "https://static01.nyt.com/newsgraphics/2016/11/01/election-map-forms/738e8fe0f4e6d89ec6cb63555d3deb92e772f916/counties.png";
+const LOCATION_IMAGE = "https://pubs.usgs.gov/gip/mapsofus/graphics/5d.gif";
+
+const QUIZ_DATA = [
+    // State Capitals (IDs 1-4, 39-63)
+    { id: 1, category: 'capitals', question: 'What is the capital of California?', options: ['Los Angeles', 'San Diego', 'Sacramento', 'San Jose'], correctAnswer: 2, imageUrl: STATE_IMAGE },
+    { id: 2, category: 'capitals', question: 'What is the capital of New York State?', options: ['New York City', 'Albany', 'Buffalo', 'Rochester'], correctAnswer: 1, imageUrl: STATE_IMAGE },
+    { id: 3, category: 'capitals', question: 'What is the capital of Texas?', options: ['Dallas', 'Houston', 'Austin', 'San Antonio'], correctAnswer: 2, imageUrl: STATE_IMAGE },
+    { id: 4, category: 'capitals', question: 'What is the capital of Florida?', options: ['Miami', 'Orlando', 'Tampa', 'Tallahassee'], correctAnswer: 3, imageUrl: STATE_IMAGE },
+    { id: 39, category: 'capitals', question: 'What is the capital of Illinois?', options: ['Chicago', 'Peoria', 'Springfield', 'Rockford'], correctAnswer: 2, imageUrl: STATE_IMAGE },
+    { id: 40, category: 'capitals', question: 'What is the capital of Pennsylvania?', options: ['Philadelphia', 'Pittsburgh', 'Harrisburg', 'Allentown'], correctAnswer: 2, imageUrl: STATE_IMAGE },
+    { id: 41, category: 'capitals', question: 'What is the capital of Ohio?', options: ['Cleveland', 'Cincinnati', 'Columbus', 'Toledo'], correctAnswer: 2, imageUrl: STATE_IMAGE },
+    { id: 42, category: 'capitals', question: 'What is the capital of Michigan?', options: ['Detroit', 'Grand Rapids', 'Lansing', 'Ann Arbor'], correctAnswer: 2, imageUrl: STATE_IMAGE },
+    { id: 43, category: 'capitals', question: 'What is the capital of Georgia?', options: ['Atlanta', 'Savannah', 'Augusta', 'Columbus'], correctAnswer: 0, imageUrl: STATE_IMAGE },
+    { id: 44, category: 'capitals', question: 'What is the capital of North Carolina?', options: ['Charlotte', 'Raleigh', 'Greensboro', 'Durham'], correctAnswer: 1, imageUrl: STATE_IMAGE },
+    { id: 45, category: 'capitals', question: 'What is the capital of Washington?', options: ['Seattle', 'Spokane', 'Tacoma', 'Olympia'], correctAnswer: 3, imageUrl: STATE_IMAGE },
+    { id: 46, category: 'capitals', question: 'What is the capital of Massachusetts?', options: ['Springfield', 'Worcester', 'Boston', 'Cambridge'], correctAnswer: 2, imageUrl: STATE_IMAGE },
+    { id: 47, category: 'capitals', question: 'What is the capital of Virginia?', options: ['Norfolk', 'Richmond', 'Virginia Beach', 'Chesapeake'], correctAnswer: 1, imageUrl: STATE_IMAGE },
+    { id: 48, category: 'capitals', question: 'What is the capital of Maryland?', options: ['Baltimore', 'Annapolis', 'Rockville', 'Frederick'], correctAnswer: 1, imageUrl: STATE_IMAGE },
+    { id: 49, category: 'capitals', question: 'What is the capital of Indiana?', options: ['Fort Wayne', 'Indianapolis', 'Evansville', 'South Bend'], correctAnswer: 1, imageUrl: STATE_IMAGE },
+    { id: 50, category: 'capitals', question: 'What is the capital of Tennessee?', options: ['Memphis', 'Knoxville', 'Nashville', 'Chattanooga'], correctAnswer: 2, imageUrl: STATE_IMAGE },
+    { id: 51, category: 'capitals', question: 'What is the capital of Missouri?', options: ['St. Louis', 'Kansas City', 'Springfield', 'Jefferson City'], correctAnswer: 3, imageUrl: STATE_IMAGE },
+    { id: 52, category: 'capitals', question: 'What is the capital of Wisconsin?', options: ['Milwaukee', 'Green Bay', 'Madison', 'Kenosha'], correctAnswer: 2, imageUrl: STATE_IMAGE },
+    { id: 53, category: 'capitals', question: 'What is the capital of Colorado?', options: ['Boulder', 'Colorado Springs', 'Denver', 'Aurora'], correctAnswer: 2, imageUrl: STATE_IMAGE },
+    { id: 54, category: 'capitals', question: 'What is the capital of Oregon?', options: ['Portland', 'Salem', 'Eugene', 'Gresham'], correctAnswer: 1, imageUrl: STATE_IMAGE },
+    { id: 55, category: 'capitals', question: 'What is the capital of Arizona?', options: ['Tucson', 'Mesa', 'Phoenix', 'Chandler'], correctAnswer: 2, imageUrl: STATE_IMAGE },
+    { id: 56, category: 'capitals', question: 'What is the capital of Alabama?', options: ['Birmingham', 'Huntsville', 'Montgomery', 'Mobile'], correctAnswer: 2, imageUrl: STATE_IMAGE },
+    { id: 57, category: 'capitals', question: 'What is the capital of South Carolina?', options: ['Charleston', 'Columbia', 'Greenville', 'North Charleston'], correctAnswer: 1, imageUrl: STATE_IMAGE },
+    { id: 58, category: 'capitals', question: 'What is the capital of Louisiana?', options: ['New Orleans', 'Baton Rouge', 'Shreveport', 'Lafayette'], correctAnswer: 1, imageUrl: STATE_IMAGE },
+    { id: 59, category: 'capitals', question: 'What is the capital of Kentucky?', options: ['Louisville', 'Lexington', 'Frankfort', 'Bowling Green'], correctAnswer: 2, imageUrl: STATE_IMAGE },
+    { id: 60, category: 'capitals', question: 'What is the capital of Oklahoma?', options: ['Tulsa', 'Norman', 'Oklahoma City', 'Broken Arrow'], correctAnswer: 2, imageUrl: STATE_IMAGE },
+    { id: 61, category: 'capitals', question: 'What is the capital of Connecticut?', options: ['Bridgeport', 'New Haven', 'Stamford', 'Hartford'], correctAnswer: 3, imageUrl: STATE_IMAGE },
+    { id: 62, category: 'capitals', question: 'What is the capital of Nevada?', options: ['Las Vegas', 'Reno', 'Carson City', 'Henderson'], correctAnswer: 2, imageUrl: STATE_IMAGE },
+    { id: 63, category: 'capitals', question: 'What is the capital of Alaska?', options: ['Anchorage', 'Fairbanks', 'Juneau', 'Sitka'], correctAnswer: 2, imageUrl: STATE_IMAGE },
+
+    // Presidents' Terms of Office (IDs 5-7, 64-88)
+    { id: 5, category: 'presidents', question: 'Who served as President during the Civil War?', options: ['Ulysses S. Grant', 'Andrew Johnson', 'Abraham Lincoln', 'James Buchanan'], correctAnswer: 2, imageUrl: PRESIDENT_IMAGE },
+    { id: 6, category: 'presidents', question: 'Which President oversaw the purchase of the Louisiana Territory?', options: ['George Washington', 'John Adams', 'Thomas Jefferson', 'James Madison'], correctAnswer: 2, imageUrl: PRESIDENT_IMAGE },
+    { id: 7, category: 'presidents', question: 'Who was the first President to live in the White House?', options: ['George Washington', 'John Adams', 'Thomas Jefferson', 'James Madison'], correctAnswer: 1, imageUrl: PRESIDENT_IMAGE },
+    { id: 64, category: 'presidents', question: 'Which U.S. President resigned from office?', options: ['Bill Clinton', 'Richard Nixon', 'Andrew Johnson', 'Herbert Hoover'], correctAnswer: 1, imageUrl: PRESIDENT_IMAGE },
+    { id: 65, category: 'presidents', question: 'Who was the only President to serve two non-consecutive terms?', options: ['John Adams', 'Grover Cleveland', 'Chester Arthur', 'Millard Fillmore'], correctAnswer: 1, imageUrl: PRESIDENT_IMAGE },
+    { id: 66, category: 'presidents', question: 'Which President was in office when the Stock Market crashed in 1929?', options: ['Calvin Coolidge', 'Herbert Hoover', 'Franklin D. Roosevelt', 'Warren G. Harding'], correctAnswer: 1, imageUrl: PRESIDENT_IMAGE },
+    { id: 67, category: 'presidents', question: 'Which President signed the Emancipation Proclamation?', options: ['Andrew Johnson', 'Abraham Lincoln', 'Ulysses S. Grant', 'Rutherford B. Hayes'], correctAnswer: 1, imageUrl: PRESIDENT_IMAGE },
+    { id: 68, category: 'presidents', question: 'Who was the President when the attack on Pearl Harbor occurred?', options: ['Franklin D. Roosevelt', 'Harry S. Truman', 'Dwight D. Eisenhower', 'John F. Kennedy'], correctAnswer: 0, imageUrl: PRESIDENT_IMAGE },
+    { id: 69, category: 'presidents', question: 'Which President is credited with establishing the national park system?', options: ['Abraham Lincoln', 'Woodrow Wilson', 'Theodore Roosevelt', 'Franklin D. Roosevelt'], correctAnswer: 2, imageUrl: PRESIDENT_IMAGE },
+    { id: 70, category: 'presidents', question: 'Who was the President during the Cuban Missile Crisis?', options: ['Lyndon B. Johnson', 'Richard Nixon', 'John F. Kennedy', 'Dwight D. Eisenhower'], correctAnswer: 2, imageUrl: PRESIDENT_IMAGE },
+    { id: 71, category: 'presidents', question: 'Which President was a famous general in World War II?', options: ['Dwight D. Eisenhower', 'Harry S. Truman', 'John F. Kennedy', 'Ronald Reagan'], correctAnswer: 0, imageUrl: PRESIDENT_IMAGE },
+    { id: 72, category: 'presidents', question: 'Who was the President at the end of the Cold War?', options: ['Ronald Reagan', 'George H.W. Bush', 'Bill Clinton', 'George W. Bush'], correctAnswer: 1, imageUrl: PRESIDENT_IMAGE },
+    { id: 73, category: 'presidents', question: 'Who holds the record for the shortest term as President?', options: ['William Henry Harrison', 'James K. Polk', 'Zachary Taylor', 'Millard Fillmore'], correctAnswer: 0, imageUrl: PRESIDENT_IMAGE },
+    { id: 74, category: 'presidents', question: 'Which President was impeached but acquitted by the Senate?', options: ['Richard Nixon', 'Bill Clinton', 'Andrew Johnson', 'Both B and C'], correctAnswer: 3, imageUrl: PRESIDENT_IMAGE },
+    { id: 75, category: 'presidents', question: 'Who was the youngest elected President of the U.S.?', options: ['Theodore Roosevelt', 'John F. Kennedy', 'Bill Clinton', 'Barack Obama'], correctAnswer: 1, imageUrl: PRESIDENT_IMAGE },
+    { id: 76, category: 'presidents', question: 'Which President was nicknamed "Honest Abe"?', options: ['Thomas Jefferson', 'George Washington', 'Abraham Lincoln', 'Andrew Jackson'], correctAnswer: 2, imageUrl: PRESIDENT_IMAGE },
+    { id: 77, category: 'presidents', question: 'Who was the first Vice President to assume the Presidency upon the death of a President?', options: ['Andrew Johnson', 'Theodore Roosevelt', 'John Tyler', 'Chester Arthur'], correctAnswer: 2, imageUrl: PRESIDENT_IMAGE },
+    { id: 78, category: 'presidents', question: 'Which President championed the "Great Society" programs?', options: ['John F. Kennedy', 'Lyndon B. Johnson', 'Richard Nixon', 'Jimmy Carter'], correctAnswer: 1, imageUrl: PRESIDENT_IMAGE },
+    { id: 79, category: 'presidents', question: 'Who was the President when the Berlin Wall fell?', options: ['Ronald Reagan', 'George H.W. Bush', 'Bill Clinton', 'Jimmy Carter'], correctAnswer: 1, imageUrl: PRESIDENT_IMAGE },
+    { id: 80, category: 'presidents', question: 'Which President established the Peace Corps?', options: ['Lyndon B. Johnson', 'John F. Kennedy', 'Richard Nixon', 'Jimmy Carter'], correctAnswer: 1, imageUrl: PRESIDENT_IMAGE },
+    { id: 81, category: 'presidents', question: 'Who was the President during the War of 1812?', options: ['Thomas Jefferson', 'James Madison', 'John Quincy Adams', 'James Monroe'], correctAnswer: 1, imageUrl: PRESIDENT_IMAGE },
+    { id: 82, category: 'presidents', question: 'Which President authorized the dropping of the atomic bombs on Japan?', options: ['Franklin D. Roosevelt', 'Harry S. Truman', 'Dwight D. Eisenhower', 'John F. Kennedy'], correctAnswer: 1, imageUrl: PRESIDENT_IMAGE },
+    { id: 83, category: 'presidents', question: 'Who was the President when the 9/11 attacks occurred?', options: ['Bill Clinton', 'George W. Bush', 'Barack Obama', 'Donald Trump'], correctAnswer: 1, imageUrl: PRESIDENT_IMAGE },
+    { id: 84, category: 'presidents', question: 'Which President was a former actor and governor of California?', options: ['Jimmy Carter', 'Ronald Reagan', 'George W. Bush', 'Gerald Ford'], correctAnswer: 1, imageUrl: PRESIDENT_IMAGE },
+    { id: 85, category: 'presidents', question: 'Who was the President known for his "Square Deal" domestic policy?', options: ['William Howard Taft', 'Woodrow Wilson', 'Theodore Roosevelt', 'Franklin D. Roosevelt'], correctAnswer: 2, imageUrl: PRESIDENT_IMAGE },
+    { id: 86, category: 'presidents', question: 'Which President signed the Affordable Care Act (ACA)?', options: ['George W. Bush', 'Barack Obama', 'Donald Trump', 'Joe Biden'], correctAnswer: 1, imageUrl: PRESIDENT_IMAGE },
+    { id: 87, category: 'presidents', question: 'Who was the President during the Mexican-American War?', options: ['James K. Polk', 'Zachary Taylor', 'Franklin Pierce', 'James Buchanan'], correctAnswer: 0, imageUrl: PRESIDENT_IMAGE },
+    { id: 88, category: 'presidents', question: 'Which President delivered the famous "A house divided" speech?', options: ['George Washington', 'Thomas Jefferson', 'Abraham Lincoln', 'Theodore Roosevelt'], correctAnswer: 2, imageUrl: PRESIDENT_IMAGE },
+
+    // U.S. Presidential Elections (IDs 8-10, 89-113)
+    { id: 8, category: 'elections', question: 'In what year did Bill Clinton first get elected?', options: ['1988', '1992', '1996', '2000'], correctAnswer: 1, imageUrl: PRESIDENT_IMAGE },
+    { id: 9, category: 'elections', question: 'Which political party did Franklin D. Roosevelt represent?', options: ['Republican', 'Whig', 'Democratic', 'Progressive'], correctAnswer: 2, imageUrl: PRESIDENT_IMAGE },
+    { id: 10, category: 'elections', question: 'What is the minimum age to be elected President of the U.S.?', options: ['25', '30', '35', '40'], correctAnswer: 2, imageUrl: ELECTION_IMAGE },
+    { id: 89, category: 'elections', question: 'In the 1800 election, which candidate defeated John Adams?', options: ['Andrew Jackson', 'James Monroe', 'Thomas Jefferson', 'John Quincy Adams'], correctAnswer: 2, imageUrl: PRESIDENT_IMAGE },
+    { id: 90, category: 'elections', question: 'Which President was elected four times?', options: ['George Washington', 'Theodore Roosevelt', 'Franklin D. Roosevelt', 'Thomas Jefferson'], correctAnswer: 2, imageUrl: PRESIDENT_IMAGE },
+    { id: 91, category: 'elections', question: 'Who were the major party candidates in the 2008 U.S. Presidential election?', options: ['Bush and Gore', 'Obama and McCain', 'Obama and Romney', 'Clinton and Trump'], correctAnswer: 1, imageUrl: PRESIDENT_IMAGE },
+    { id: 92, category: 'elections', question: 'How many electoral votes does a candidate need to win the presidency?', options: ['270', '538', '435', '100'], correctAnswer: 0, imageUrl: ELECTION_IMAGE },
+    { id: 93, category: 'elections', question: 'The U.S. presidential election is held every how many years?', options: ['2', '4', '5', '6'], correctAnswer: 1, imageUrl: ELECTION_IMAGE },
+    { id: 94, category: 'elections', question: 'Which constitutional amendment limits the president to two terms?', options: ['20th', '22nd', '24th', '26th'], correctAnswer: 1, imageUrl: ELECTION_IMAGE },
+    { id: 95, category: 'elections', question: 'Which political party is associated with the symbol of a donkey?', options: ['Republican', 'Democratic', 'Whig', 'Libertarian'], correctAnswer: 1, imageUrl: ELECTION_IMAGE },
+    { id: 96, category: 'elections', question: 'Which political party is associated with the symbol of an elephant?', options: ['Democratic', 'Republican', 'Green', 'Conservative'], correctAnswer: 1, imageUrl: ELECTION_IMAGE },
+    { id: 97, category: 'elections', question: 'In the 1824 election, who won the presidency despite losing the popular vote?', options: ['Andrew Jackson', 'John Quincy Adams', 'Henry Clay', 'William Crawford'], correctAnswer: 1, imageUrl: PRESIDENT_IMAGE },
+    { id: 98, category: 'elections', question: 'The term "landslide victory" is often associated with which president and year?', options: ['FDR in 1932', 'Nixon in 1972', 'Reagan in 1984', 'All of the above'], correctAnswer: 3, imageUrl: PRESIDENT_IMAGE },
+    { id: 99, category: 'elections', question: 'Which candidate won the popular vote but lost the electoral college in 2016?', options: ['Donald Trump', 'Hillary Clinton', 'Gary Johnson', 'Jill Stein'], correctAnswer: 1, imageUrl: PRESIDENT_IMAGE },
+    { id: 100, category: 'elections', question: 'The first election where women could vote nationwide was in what year?', options: ['1916', '1920', '1924', '1932'], correctAnswer: 1, imageUrl: ELECTION_IMAGE },
+    { id: 101, category: 'elections', question: 'Who was the third-party candidate in the 1992 election who gained significant support?', options: ['Ralph Nader', 'Pat Buchanan', 'Ross Perot', 'George Wallace'], correctAnswer: 2, imageUrl: PRESIDENT_IMAGE },
+    { id: 102, category: 'elections', question: 'The electoral college system was primarily established to ensure what?', options: ['Every state has equal power', 'Large states don\'t dominate small states', 'A balance between popular and congressional choice', 'All citizens are represented'], correctAnswer: 2, imageUrl: ELECTION_IMAGE },
+    { id: 103, category: 'elections', question: 'In the 2000 election, the Supreme Court case Bush v. Gore decided the outcome in which state?', options: ['Ohio', 'Pennsylvania', 'Florida', 'Michigan'], correctAnswer: 2, imageUrl: ELECTION_IMAGE },
+    { id: 104, category: 'elections', question: 'What is the term for a voter who does not align with a major political party?', options: ['Nominee', 'Delegate', 'Independent', 'Moderator'], correctAnswer: 2, imageUrl: ELECTION_IMAGE },
+    { id: 105, category: 'elections', question: 'Which President was a former host of a reality TV show?', options: ['Ronald Reagan', 'Donald Trump', 'George W. Bush', 'Jimmy Carter'], correctAnswer: 1, imageUrl: PRESIDENT_IMAGE },
+    { id: 106, category: 'elections', question: 'What is the term for the process of drawing electoral district boundaries to give one political party an unfair advantage?', options: ['Redistricting', 'Apportionment', 'Gerrymandering', 'Suffrage'], correctAnswer: 2, imageUrl: ELECTION_IMAGE },
+    { id: 107, category: 'elections', question: 'Who was the Democratic challenger to Ronald Reagan in the 1980 election?', options: ['Jimmy Carter', 'Walter Mondale', 'Michael Dukakis', 'Gary Hart'], correctAnswer: 0, imageUrl: PRESIDENT_IMAGE },
+    { id: 108, category: 'elections', question: 'The Federalist Party dissolved after the election of which President?', options: ['George Washington', 'John Adams', 'Thomas Jefferson', 'James Monroe'], correctAnswer: 3, imageUrl: PRESIDENT_IMAGE },
+    { id: 109, category: 'elections', question: 'What is the term for the preliminary election in which party members nominate candidates for the general election?', options: ['Caucus', 'Convention', 'Primary', 'Referendum'], correctAnswer: 2, imageUrl: ELECTION_IMAGE },
+    { id: 110, category: 'elections', question: 'Which election featured the "Cross of Gold" speech by William Jennings Bryan?', options: ['1896', '1900', '1904', '1912'], correctAnswer: 0, imageUrl: ELECTION_IMAGE },
+    { id: 111, category: 'elections', question: 'Who was the Democratic nominee who lost to Dwight D. Eisenhower twice?', options: ['Adlai Stevenson', 'Hubert Humphrey', 'Lyndon B. Johnson', 'Harry S. Truman'], correctAnswer: 0, imageUrl: PRESIDENT_IMAGE },
+    { id: 112, category: 'elections', question: 'Which election year saw the largest shift in electoral votes from one party to another?', options: ['1860', '1932', '1980', '2008'], correctAnswer: 1, imageUrl: ELECTION_IMAGE },
+    { id: 113, category: 'elections', question: 'Who defeated the incumbent President George H.W. Bush in the 1992 election?', options: ['Bob Dole', 'Ross Perot', 'Bill Clinton', 'Al Gore'], correctAnswer: 2, imageUrl: PRESIDENT_IMAGE },
+
+    // U.S. Geography (IDs 11-13, 14-38)
+    { id: 11, category: 'geography', question: 'Which river is the longest in the United States?', options: ['Colorado River', 'Mississippi River', 'Missouri River', 'Columbia River'], correctAnswer: 2, imageUrl: STATE_IMAGE },
+    { id: 12, category: 'geography', question: 'Which state is known as the "Sunshine State"?', options: ['California', 'Arizona', 'Florida', 'Hawaii'], correctAnswer: 2, imageUrl: STATE_IMAGE },
+    { id: 13, category: 'geography', question: 'What is the highest mountain peak in North America (located in Alaska)?', options: ['Mount Whitney', 'Mount Rainier', 'Mount Denali (McKinley)', 'Mount Elbert'], correctAnswer: 2, imageUrl: STATE_IMAGE },
+    { id: 14, category: 'geography', question: 'Which mountain range runs along the eastern side of the United States?', options: ['Rocky Mountains', 'Sierra Nevada', 'Appalachian Mountains', 'Cascade Range'], correctAnswer: 2, imageUrl: STATE_IMAGE },
+    { id: 15, category: 'geography', question: 'What is the largest freshwater lake by surface area entirely within the U.S.?', options: ['Lake Superior', 'Lake Huron', 'Lake Michigan', 'Lake Erie'], correctAnswer: 2, imageUrl: STATE_IMAGE },
+    { id: 16, category: 'geography', question: 'Which state is the largest in area, excluding Alaska?', options: ['California', 'Texas', 'Montana', 'New Mexico'], correctAnswer: 1, imageUrl: STATE_IMAGE },
+    { id: 17, category: 'geography', question: 'The Great Salt Lake is located in which U.S. state?', options: ['Nevada', 'Colorado', 'Utah', 'Idaho'], correctAnswer: 2, imageUrl: STATE_IMAGE },
+    { id: 18, category: 'geography', question: 'Which desert covers large parts of Arizona, California, and Nevada?', options: ['Chihuahuan Desert', 'Sonoran Desert', 'Mojave Desert', 'Great Basin Desert'], correctAnswer: 2, imageUrl: STATE_IMAGE },
+    { id: 19, category: 'geography', question: 'The "Four Corners" monument marks the intersection of which four states?', options: ['AZ, CO, UT, WY', 'AZ, CO, UT, NM', 'CO, NM, TX, OK', 'UT, CO, WY, ID'], correctAnswer: 1, imageUrl: STATE_IMAGE },
+    { id: 20, category: 'geography', question: 'Which body of water is east of the United States?', options: ['Pacific Ocean', 'Gulf of Mexico', 'Arctic Ocean', 'Atlantic Ocean'], correctAnswer: 3, imageUrl: STATE_IMAGE },
+    { id: 21, category: 'geography', question: 'Which of the Great Lakes is entirely within the borders of the U.S.?', options: ['Lake Erie', 'Lake Huron', 'Lake Ontario', 'Lake Michigan'], correctAnswer: 3, imageUrl: STATE_IMAGE },
+    { id: 22, category: 'geography', question: 'The Grand Canyon is located in which state?', options: ['California', 'Utah', 'Arizona', 'New Mexico'], correctAnswer: 2, imageUrl: STATE_IMAGE },
+    { id: 23, category: 'geography', question: 'Which U.S. state has the longest coastline?', options: ['Florida', 'California', 'Alaska', 'Texas'], correctAnswer: 2, imageUrl: STATE_IMAGE },
+    { id: 24, category: 'geography', question: 'Which state is home to Yellowstone National Park?', options: ['Montana', 'Idaho', 'Wyoming', 'All of the above'], correctAnswer: 3, imageUrl: STATE_IMAGE },
+    { id: 25, category: 'geography', question: 'The city of Seattle is located on the shores of which body of water?', options: ['Puget Sound', 'Pacific Ocean', 'Columbia River', 'Lake Superior'], correctAnswer: 0, imageUrl: STATE_IMAGE },
+    { id: 26, category: 'geography', question: 'The Continental Divide primarily runs along which mountain range?', options: ['Appalachians', 'Cascades', 'Rocky Mountains', 'Sierra Nevada'], correctAnswer: 2, imageUrl: STATE_IMAGE },
+    { id: 27, category: 'geography', question: 'What is the deepest lake in the U.S.?', options: ['Lake Superior', 'Crater Lake', 'Lake Tahoe', 'Great Slave Lake'], correctAnswer: 1, imageUrl: STATE_IMAGE },
+    { id: 28, category: 'geography', question: 'Which region of the U.S. is commonly referred to as the "Tornado Alley"?', options: ['Northeast', 'Pacific Northwest', 'Great Plains', 'Deep South'], correctAnswer: 2, imageUrl: STATE_IMAGE },
+    { id: 29, category: 'geography', question: 'Which major river forms the boundary between Texas and Mexico?', options: ['Colorado River', 'Mississippi River', 'Rio Grande', 'Pecos River'], correctAnswer: 2, imageUrl: STATE_IMAGE },
+    { id: 30, category: 'geography', question: 'Which state is not part of the contiguous United States?', options: ['Hawaii', 'Maine', 'Arizona', 'Montana'], correctAnswer: 0, imageUrl: STATE_IMAGE },
+    { id: 31, category: 'geography', question: 'What is the name of the valley in California known for its high-tech industry?', options: ['Napa Valley', 'Death Valley', 'Central Valley', 'Silicon Valley'], correctAnswer: 3, imageUrl: STATE_IMAGE },
+    { id: 32, category: 'geography', question: 'Which U.S. state is the smallest in terms of land area?', options: ['Delaware', 'Connecticut', 'Rhode Island', 'New Jersey'], correctAnswer: 2, imageUrl: STATE_IMAGE },
+    { id: 33, category: 'geography', question: 'The city of New Orleans is located near the mouth of which river?', options: ['Alabama River', 'Colorado River', 'Missouri River', 'Mississippi River'], correctAnswer: 3, imageUrl: STATE_IMAGE },
+    { id: 34, category: 'geography', question: 'The Ozark Mountains primarily span which two states?', options: ['Texas and Oklahoma', 'Arkansas and Missouri', 'Tennessee and Kentucky', 'North Carolina and Georgia'], correctAnswer: 1, imageUrl: STATE_IMAGE },
+    { id: 35, category: 'geography', question: 'Which state is known as the "Land of 10,000 Lakes"?', options: ['Wisconsin', 'Michigan', 'Minnesota', 'Florida'], correctAnswer: 2, imageUrl: STATE_IMAGE },
+    { id: 36, category: 'geography', question: 'What is the name of the peninsula that makes up most of Florida?', options: ['Baja', 'Delmarva', 'Keweenaw', 'Florida Peninsula'], correctAnswer: 3, imageUrl: STATE_IMAGE },
+    { id: 37, category: 'geography', question: 'Which U.S. state is farthest west?', options: ['California', 'Washington', 'Oregon', 'Alaska'], correctAnswer: 3, imageUrl: STATE_IMAGE },
+    { id: 38, category: 'geography', question: 'Which state is famous for Mount Rushmore?', options: ['North Dakota', 'Montana', 'South Dakota', 'Wyoming'], correctAnswer: 2, imageUrl: STATE_IMAGE },
+
+    // NEW CATEGORY 1: State Elections (IDs 114-138)
+    { id: 114, category: 'state_elections', question: 'In the 2000 Presidential election, which party won the crucial state of Florida?', options: ['Democratic', 'Republican', 'Green Party', 'Reform Party'], correctAnswer: 1, imageUrl: ELECTION_IMAGE },
+    { id: 115, category: 'state_elections', question: 'Which party won the state of Texas in the 2004 Presidential election?', options: ['Democratic', 'Republican', 'Libertarian', 'Green Party'], correctAnswer: 1, imageUrl: ELECTION_IMAGE },
+    { id: 116, category: 'state_elections', question: 'Which party won the state of New York in the 2012 Presidential election?', options: ['Republican', 'Democratic', 'Independent', 'Green Party'], correctAnswer: 1, imageUrl: ELECTION_IMAGE },
+    { id: 117, category: 'state_elections', question: 'In 2016, which party won the state of Michigan?', options: ['Democratic', 'Republican', 'Green Party', 'Libertarian'], correctAnswer: 1, imageUrl: ELECTION_IMAGE },
+    { id: 118, category: 'state_elections', question: 'Which party won the state of California in the 2020 Presidential election?', options: ['Republican', 'Democratic', 'Green Party', 'Reform Party'], correctAnswer: 1, imageUrl: ELECTION_IMAGE },
+    { id: 119, category: 'state_elections', question: 'Which party won the state of Ohio in the 2008 Presidential election?', options: ['Democratic', 'Republican', 'Green Party', 'Libertarian'], correctAnswer: 0, imageUrl: ELECTION_IMAGE },
+    { id: 120, category: 'state_elections', question: 'In 2012, which party won the state of Florida?', options: ['Republican', 'Democratic', 'Green Party', 'Reform Party'], correctAnswer: 1, imageUrl: ELECTION_IMAGE },
+    { id: 121, category: 'state_elections', question: 'Which party won the state of Pennsylvania in the 2016 Presidential election?', options: ['Democratic', 'Republican', 'Green Party', 'Libertarian'], correctAnswer: 1, imageUrl: ELECTION_IMAGE },
+    { id: 122, category: 'state_elections', question: 'In 2020, which party won the state of Arizona?', options: ['Republican', 'Democratic', 'Green Party', 'Independent'], correctAnswer: 1, imageUrl: ELECTION_IMAGE },
+    { id: 123, category: 'state_elections', question: 'Which party won the state of Georgia in the 2020 Presidential election?', options: ['Republican', 'Democratic', 'Green Party', 'Libertarian'], correctAnswer: 1, imageUrl: ELECTION_IMAGE },
+    { id: 124, category: 'state_elections', question: 'Which party won the state of North Carolina in the 2012 Presidential election?', options: ['Democratic', 'Republican', 'Green Party', 'Reform Party'], correctAnswer: 1, imageUrl: ELECTION_IMAGE },
+    { id: 125, category: 'state_elections', question: 'In 2004, which party won the state of New Jersey?', options: ['Republican', 'Democratic', 'Green Party', 'Libertarian'], correctAnswer: 1, imageUrl: ELECTION_IMAGE },
+    { id: 126, category: 'state_elections', question: 'Which party won the state of Virginia in the 2008 Presidential election?', options: ['Democratic', 'Republican', 'Green Party', 'Independent'], correctAnswer: 0, imageUrl: ELECTION_IMAGE },
+    { id: 127, category: 'state_elections', question: 'In 2016, which party won the state of Wisconsin?', options: ['Democratic', 'Republican', 'Green Party', 'Libertarian'], correctAnswer: 1, imageUrl: ELECTION_IMAGE },
+    { id: 128, category: 'state_elections', question: 'Which party won the state of Colorado in the 2020 Presidential election?', options: ['Republican', 'Democratic', 'Green Party', 'Reform Party'], correctAnswer: 1, imageUrl: ELECTION_IMAGE },
+    { id: 129, category: 'state_elections', question: 'Which party won the state of Iowa in the 2012 Presidential election?', options: ['Democratic', 'Republican', 'Independent', 'Libertarian'], correctAnswer: 0, imageUrl: ELECTION_IMAGE },
+    { id: 130, category: 'state_elections', question: 'In 2004, which party won the state of Pennsylvania?', options: ['Republican', 'Democratic', 'Green Party', 'Reform Party'], correctAnswer: 1, imageUrl: ELECTION_IMAGE },
+    { id: 131, category: 'state_elections', question: 'Which party won the state of Nevada in the 2020 Presidential election?', options: ['Democratic', 'Republican', 'Green Party', 'Libertarian'], correctAnswer: 0, imageUrl: ELECTION_IMAGE },
+    { id: 132, category: 'state_elections', question: 'In 2016, which party won the state of Ohio?', options: ['Democratic', 'Republican', 'Green Party', 'Independent'], correctAnswer: 1, imageUrl: ELECTION_IMAGE },
+    { id: 133, category: 'state_elections', question: 'Which party won the state of Minnesota in the 2008 Presidential election?', options: ['Republican', 'Democratic', 'Green Party', 'Reform Party'], correctAnswer: 1, imageUrl: ELECTION_IMAGE },
+    { id: 134, category: 'state_elections', question: 'Which party won the state of New Mexico in the 2012 Presidential election?', options: ['Democratic', 'Republican', 'Green Party', 'Libertarian'], correctAnswer: 0, imageUrl: ELECTION_IMAGE },
+    { id: 135, category: 'state_elections', question: 'In 2004, which party won the state of Washington?', options: ['Republican', 'Democratic', 'Green Party', 'Reform Party'], correctAnswer: 1, imageUrl: ELECTION_IMAGE },
+    { id: 136, category: 'state_elections', question: 'Which party won the state of Indiana in the 2008 Presidential election?', options: ['Democratic', 'Republican', 'Green Party', 'Independent'], correctAnswer: 0, imageUrl: ELECTION_IMAGE },
+    { id: 137, category: 'state_elections', question: 'In 2016, which party won the state of Maine (at-large)?', options: ['Democratic', 'Republican', 'Green Party', 'Libertarian'], correctAnswer: 1, imageUrl: ELECTION_IMAGE },
+    { id: 138, category: 'state_elections', question: 'Which party won the state of Wisconsin in the 2000 Presidential election?', options: ['Republican', 'Democratic', 'Green Party', 'Reform Party'], correctAnswer: 1, imageUrl: ELECTION_IMAGE },
+
+
+    // NEW CATEGORY 2: Geographical Location (IDs 139-163)
+    { id: 139, category: 'geography_location', question: 'Which state is immediately south of Virginia, bordering the Atlantic Ocean?', options: ['North Carolina', 'Tennessee', 'Kentucky', 'West Virginia'], correctAnswer: 0, imageUrl: LOCATION_IMAGE },
+    { id: 140, category: 'geography_location', question: 'Which state is the closest U.S. state to Russia?', options: ['Washington', 'Alaska', 'Hawaii', 'Maine'], correctAnswer: 1, imageUrl: LOCATION_IMAGE },
+    { id: 141, category: 'geography_location', question: 'Which state is directly north of Florida?', options: ['Alabama', 'Georgia', 'South Carolina', 'Mississippi'], correctAnswer: 1, imageUrl: LOCATION_IMAGE },
+    { id: 142, category: 'geography_location', question: 'Which state is bordered by the Pacific Ocean to the west, Oregon to the north, and Nevada to the east?', options: ['California', 'Washington', 'Arizona', 'Idaho'], correctAnswer: 0, imageUrl: LOCATION_IMAGE },
+    { id: 143, category: 'geography_location', question: 'Which is the northernmost state in the contiguous United States?', options: ['North Dakota', 'Minnesota', 'Montana', 'Washington'], correctAnswer: 1, imageUrl: LOCATION_IMAGE },
+    { id: 144, category: 'geography_location', question: 'Which state shares the longest border with Canada?', options: ['Montana', 'New York', 'Michigan', 'Alaska'], correctAnswer: 3, imageUrl: LOCATION_IMAGE },
+    { id: 145, category: 'geography_location', question: 'Which state is directly west of Pennsylvania?', options: ['New York', 'Ohio', 'West Virginia', 'Maryland'], correctAnswer: 1, imageUrl: LOCATION_IMAGE },
+    { id: 146, category: 'geography_location', question: 'Which state is directly east of Arizona?', options: ['Utah', 'New Mexico', 'Texas', 'Colorado'], correctAnswer: 1, imageUrl: LOCATION_IMAGE },
+    { id: 147, category: 'geography_location', question: 'Which state borders four of the five Great Lakes?', options: ['Ohio', 'New York', 'Michigan', 'Pennsylvania'], correctAnswer: 2, imageUrl: LOCATION_IMAGE },
+    { id: 148, category: 'geography_location', question: 'Which state is located furthest south in the continental U.S.?', options: ['Texas', 'Florida', 'Louisiana', 'California'], correctAnswer: 1, imageUrl: LOCATION_IMAGE },
+    { id: 149, category: 'geography_location', question: 'Which state borders the Pacific Ocean and Mexico?', options: ['Texas', 'New Mexico', 'California', 'Arizona'], correctAnswer: 2, imageUrl: LOCATION_IMAGE },
+    { id: 150, category: 'geography_location', question: 'Which state is immediately north of Texas?', options: ['Arkansas', 'New Mexico', 'Oklahoma', 'Louisiana'], correctAnswer: 2, imageUrl: LOCATION_IMAGE },
+    { id: 151, category: 'geography_location', question: 'Which state is located between New York and Maine?', options: ['New Hampshire', 'Massachusetts', 'Vermont', 'Rhode Island'], correctAnswer: 0, imageUrl: LOCATION_IMAGE },
+    { id: 152, category: 'geography_location', question: 'Which state borders the Mississippi River to the west and the Atlantic Ocean to the east?', options: ['Florida', 'Alabama', 'Georgia', 'South Carolina'], correctAnswer: 2, imageUrl: LOCATION_IMAGE },
+    { id: 153, category: 'geography_location', question: 'Which state is landlocked and borders both Utah and Wyoming?', options: ['Idaho', 'Colorado', 'Montana', 'Nebraska'], correctAnswer: 1, imageUrl: LOCATION_IMAGE },
+    { id: 154, category: 'geography_location', question: 'Which state is located in the Midwest and borders Lake Superior and Lake Michigan?', options: ['Illinois', 'Wisconsin', 'Iowa', 'Minnesota'], correctAnswer: 1, imageUrl: LOCATION_IMAGE },
+    { id: 155, category: 'geography_location', question: 'Which state is known as the "Garden State" and is located between New York and Delaware?', options: ['Maryland', 'Pennsylvania', 'New Jersey', 'Connecticut'], correctAnswer: 2, imageUrl: LOCATION_IMAGE },
+    { id: 156, category: 'geography_location', question: 'Which state is situated on the Gulf of Mexico and is west of Florida?', options: ['Georgia', 'Alabama', 'Mississippi', 'Louisiana'], correctAnswer: 1, imageUrl: LOCATION_IMAGE },
+    { id: 157, category: 'geography_location', question: 'Which state is bordered by Tennessee, North Carolina, and Florida?', options: ['Georgia', 'Alabama', 'South Carolina', 'Mississippi'], correctAnswer: 0, imageUrl: LOCATION_IMAGE },
+    { id: 158, category: 'geography_location', question: 'Which New England state is the smallest by area and borders Massachusetts and Rhode Island?', options: ['New Hampshire', 'Vermont', 'Connecticut', 'Rhode Island'], correctAnswer: 2, imageUrl: LOCATION_IMAGE },
+    { id: 159, category: 'geography_location', question: 'Which state is directly west of the Great Lakes state of Michigan?', options: ['Wisconsin', 'Ohio', 'Indiana', 'Illinois'], correctAnswer: 0, imageUrl: LOCATION_IMAGE },
+    { id: 160, category: 'geography_location', question: 'Which state is the largest in area among the 48 contiguous states?', options: ['California', 'Montana', 'Texas', 'New Mexico'], correctAnswer: 2, imageUrl: LOCATION_IMAGE },
+    { id: 161, category: 'geography_location', question: 'Which state is bordered by the Atlantic Ocean, Delaware, and Pennsylvania?', options: ['Virginia', 'New Jersey', 'Maryland', 'New York'], correctAnswer: 2, imageUrl: LOCATION_IMAGE },
+    { id: 162, category: 'geography_location', question: 'Which state is located immediately north of California?', options: ['Oregon', 'Nevada', 'Arizona', 'Idaho'], correctAnswer: 0, imageUrl: LOCATION_IMAGE },
+    { id: 163, category: 'geography_location', question: 'Which state is directly east of Arizona and west of Texas?', options: ['Colorado', 'New Mexico', 'Utah', 'Oklahoma'], correctAnswer: 1, imageUrl: LOCATION_IMAGE },
+];
+
+const CATEGORY_INFO = {
+    geography: { name: 'U.S. Geography', icon: Globe, color: 'bg-green-600', description: 'Rivers, major landmarks, and size facts.' },
+    geography_location: { name: 'State Locations', icon: Target, color: 'bg-yellow-600', description: 'Identify states by their relative location and borders.' },
+    capitals: { name: 'State Capitals', icon: Map, color: 'bg-indigo-600', description: 'Test your knowledge of state capitals.' },
+    presidents: { name: 'Presidential Terms', icon: Crown, color: 'bg-red-600', description: "Terms, facts, and presidential history." },
+    elections: { name: 'U.S. Elections (General)', icon: Vote, color: 'bg-purple-600', description: 'Key years, candidates, and party history.' },
+    state_elections: { name: 'State Election Outcomes', icon: BarChart4, color: 'bg-blue-600', description: 'Which party won specific states in key elections.' },
+};
+
+// --- REUSABLE COMPONENTS ---
+
+/**
+ * Main Quiz Question Component (Multiple Choice)
+ * Props: onAnswerSubmission (for score update/locking), onNext (for advancing index), isAudioUnlocked 
+ */
+const QuizQuestion = ({ question, questionNumber, onAnswerSubmission, onNext, isAudioUnlocked }) => {
+    const [selectedOptionIndex, setSelectedOptionIndex] = useState(null);
+    const [isLocked, setIsLocked] = useState(false);
+    const [finalAnswerIndex, setFinalAnswerIndex] = useState(null);
+
+    // Timer integration (30 seconds) - passes unlock state
+    const timeLeft = useTimer(30, isLocked, isAudioUnlocked);
+
+    // AI Fact Integration: isLocked is passed as isAnswered
+    const { fact, isLoading } = useGrokFact(question.question, isLocked);
+
+    // Handles user clicking an option (only selects, does not submit)
+    const handleSelectOption = (index) => {
+        if (isLocked) return;
+        setSelectedOptionIndex(index);
+    };
+
+    // Handles user clicking the Lock In button
+    const handleLockIn = () => {
+        if (isLocked || selectedOptionIndex === null) return;
+
+        // Stop timer ticking sound when locked in (handled by useTimer cleanup)
+
+        setIsLocked(true);
+        setFinalAnswerIndex(selectedOptionIndex);
+
+        const isCorrect = selectedOptionIndex === question.correctAnswer;
+        if (isCorrect && isAudioUnlocked) {
+            playTriumphSound();
+        }
+
+        // Pass correctness AND the category ID to the parent
+        onAnswerSubmission(isCorrect, question.category);
+    };
+
+    // Function called by the explicit "Next Question" button
+    const handleAdvance = () => {
+        // We no longer need to manually stop ticking here, as the isLocked state change in handleLockIn 
+        // triggers the useTimer cleanup which handles stopping the interval.
+        onNext();
+    }
+
+    // Automatically submit a failure if the timer runs out
+    useEffect(() => {
+        if (timeLeft === 0 && !isLocked) {
+            setIsLocked(true);
+            setFinalAnswerIndex(-1); // denotes timeout
+            // Pass the category ID for scoring
+            onAnswerSubmission(false, question.category);
+        }
+    }, [timeLeft, isLocked, onAnswerSubmission, question.category]); // eslint-disable-line react-hooks/exhaustive-deps
+
+    const getButtonClass = (index) => {
+        const isSelectedTransiently = index === selectedOptionIndex && !isLocked;
+        const isOptionLockedIn = index === finalAnswerIndex;
+        const isOptionCorrect = index === question.correctAnswer;
+
+        let baseClasses = `w-full p-4 text-left rounded-lg transition-all duration-300 shadow-md border-2 
+                           transform text-gray-800`;
+
+        if (!isLocked) {
+            // Pre-lock state
+            return `${baseClasses} bg-white border-gray-200 hover:bg-indigo-50 
+                    ${isSelectedTransiently ? 'ring-4 ring-indigo-400 font-bold border-indigo-500 bg-indigo-100' : 'hover:scale-[1.01] active:scale-[0.99]'}`;
+        }
+
+        // Answered state (isLocked = true)
+        if (isOptionCorrect) {
+            // Enhanced shine green effect
+            return `${baseClasses} bg-green-500 text-white font-bold border-green-700 shadow-xl shadow-green-500/80 animate-pulse-once cursor-not-allowed`;
+        }
+        if (isOptionLockedIn && !isOptionCorrect) {
+            return `${baseClasses} bg-red-500 text-white font-bold border-red-700 shadow-lg shadow-red-400/50 cursor-not-allowed`;
+        }
+        return `${baseClasses} bg-gray-100 text-gray-500 cursor-not-allowed opacity-70 shadow-none border-gray-300`;
+    };
+
+    const getLetter = (index) => String.fromCharCode(65 + index);
+
+    const timeColor = timeLeft <= 10 ? 'text-red-500 font-extrabold animate-pulse' : 'text-gray-700';
+
+    return (
+        <div className= "bg-white rounded-xl shadow-2xl p-6 lg:p-10 max-w-4xl mx-auto w-full" >
+
+        {/* Header, Timer & Progress */ }
+        < div className = "flex justify-between items-center mb-8 border-b pb-4" >
+            <p className="text-xl font-bold text-indigo-700" >
+                Question { questionNumber }
+    </p>
+        < div className = "flex items-center text-xl font-bold" >
+            <Clock className={ `w-6 h-6 mr-2 ${timeColor}` } />
+                < span className = { timeColor } > { timeLeft }s < /span>
+                    < /div>
+                    < /div>
+
+    {/* Question Text & Image */ }
+    <div className="flex flex-col lg:flex-row gap-6 mb-8 items-center" >
+
+        {/* Image Placeholder */ }
+        < div className = {`flex-shrink-0 ${question.category.includes('elections') || question.category === 'presidents' ? 'w-32 h-32' : 'w-48 h-32'} rounded-xl overflow-hidden shadow-lg border-2 border-gray-200 bg-gray-50 flex items-center justify-center`
+}>
+    <img 
+                        src={ question.imageUrl }
+alt = {`${question.category} visual`}
+className = "object-cover w-full h-full"
+onError = {(e) => { e.target.onerror = null; e.target.src = "https://placehold.co/150x150/9CA3AF/FFFFFF?text=No+Image"; }}
+/>
+    < /div>
+
+    < h2 className = "text-2xl font-extrabold text-gray-900 leading-relaxed lg:text-left text-center flex-grow" >
+        { question.question }
+        < /h2>
+        < /div>
+
+
+{/* Answer Options */ }
+<div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4" >
+{
+    question.options.map((option, index) => (
+        <button
+                        key= { index }
+                        className = { getButtonClass(index) }
+                        onClick = {() => handleSelectOption(index)}
+disabled = { isLocked || timeLeft === 0}
+                    >
+    <span className="font-mono text-lg mr-3" > { getLetter(index) }.< /span>
+        < span className = 'font-medium' > { option } < /span>
+{ isLocked && index === question.correctAnswer && <Check className="w-5 h-5 inline ml-2 text-white" />}
+{ isLocked && index === finalAnswerIndex && index !== question.correctAnswer && <X className="w-5 h-5 inline ml-2 text-white" />}
+</button>
+                ))}
+</div>
+
+{/* Lock In Button (Visible before lock-in) */ }
+{
+    !isLocked && selectedOptionIndex !== null && (
+        <button
+                    onClick={ handleLockIn }
+    disabled = { selectedOptionIndex === null
+}
+className = "mt-4 w-full py-3 bg-red-600 text-white rounded-lg font-semibold shadow-xl hover:bg-red-700 transition transform hover:scale-[1.005]"
+    >
+    <Lock className="w-5 h-5 inline mr-2" /> Lock In Answer
+        < /button>
+            )}
+
+{/* AI Fact Feedback Section (Visible after lock-in) */ }
+{
+    isLocked && (
+        <div className="mt-8 p-4 rounded-xl bg-gray-50 border border-gray-200" >
+
+            {/* Answer Feedback */ }
+            < p className = {`text-xl font-bold mb-2 flex items-center 
+                        ${(finalAnswerIndex === question.correctAnswer || finalAnswerIndex === -1) ? 'text-green-600' : 'text-red-600'}`
+}>
+    { timeLeft === 0 && finalAnswerIndex === -1 ? (
+        <><Zap className= "w-6 h-6 mr-2 text-red-600" /> Time's up! The correct answer was: **{question.options[question.correctAnswer]}**</>
+                        ) : finalAnswerIndex === question.correctAnswer ? (
+    <><Check className= "w-6 h-6 mr-2" /> Correct! Answer ** Locked -in**.< />
+                        ) : (
+    <><X className= "w-6 h-6 mr-2" /> Incorrect.Answer ** Locked -in**.The correct answer was: ** { question.options[question.correctAnswer] } ** </>
+                        )}
+</p>
+
+{/* Fun Fact Title */ }
+<h3 className="text-lg font-bold text-gray-700 mt-4 mb-2 flex items-center border-t pt-4" >
+    <Flag className="w-5 h-5 mr-2 text-indigo-500" /> AI Fun Fact
+        < /h3>
+
+{/* Fun Fact Content (Loading or Loaded) */ }
+{
+    isLoading ? (
+        <div className= "text-gray-500 flex items-center" >
+        <RefreshCw className="w-4 h-4 mr-2 animate-spin" /> Fetching fun fact...
+    </div>
+                    ) : fact ? (
+        <div className= 'text-gray-600 text-base' >
+        <p className="italic mb-2" > { fact.text } < /p>
+    {/* Sources */ }
+    {
+        fact.sources.length > 0 && (
+            <div className="text-xs text-gray-400 mt-2" >
+                Source{ fact.sources.length > 1 ? 's' : '' }:
+        {
+            fact.sources.map((src, i) => (
+                <a key= { i } href = { src.uri } target = "_blank" rel = "noopener noreferrer" className = "ml-1 hover:underline" >
+                ({ i + 1})
+        </a>
+                                    ))
+    }
+    </div>
+                            )
+}
+</div>
+                    ) : (
+    <p className= "text-gray-500 italic" > Fact retrieval initiated...</p>
+                    )}
+
+{/* Next Question Button (Always visible when locked) */ }
+<button
+                        onClick={ handleAdvance }
+className = "mt-6 w-full py-3 bg-indigo-600 text-white rounded-lg font-semibold shadow-md hover:bg-indigo-700 transition"
+    >
+    Next Question
+        < /button>
+        < /div>
+            )}
+</div>
+    );
+};
+
+
+/**
+ * Displays the final quiz results and allows the user to restart.
+ */
+const QuizResults = ({ score, totalAttempts, categoryAttempts, onRetry, onHome }) => {
+    const [studyPlan, setStudyPlan] = useState(null);
+    const [isLoadingPlan, setIsLoadingPlan] = useState(false);
+
+    const percentage = totalAttempts > 0 ? Math.round((score / totalAttempts) * 100) : 0;
+
+    // Determine the weakest category based on percentage correct
+    const weakestCategory = useMemo(() => {
+        let weakest = { category: null, percentage: 101, total: 0 };
+
+        Object.entries(categoryAttempts).forEach(([key, stats]) => {
+            if (stats.total > 1) { // Only consider categories with at least two attempts
+                const currentPercentage = Math.round((stats.correct / stats.total) * 100);
+                if (currentPercentage < weakest.percentage) {
+                    weakest = { category: key, percentage: currentPercentage, total: stats.total };
+                }
+            }
+        });
+
+        return weakest;
+    }, [categoryAttempts]);
+
+    const handleGenerateStudyPlan = async () => {
+        if (!weakestCategory.category || isLoadingPlan) return;
+
+        setIsLoadingPlan(true);
+        setStudyPlan(null);
+
+        const categoryName = CATEGORY_INFO[weakestCategory.category].name;
+
+        const systemPrompt = `You are a dedicated U.S. history and geography tutor. Your task is to provide a study guide for the user's weakest quiz category: ${categoryName}. Provide a two-paragraph explanation of the core concepts, followed by a bulleted list of 5 concrete study suggestions or common pitfalls related to this topic. Use encouraging and clear language.`;
+
+        const userQuery = `Generate a deep dive explanation and a study plan for the category: ${categoryName}, where the user scored ${weakestCategory.percentage}% on ${weakestCategory.total} questions.`;
+
+        const payload = {
+            model: GROK_MODEL,
+            messages: [
+                { role: "system", content: systemPrompt },
+                { role: "user", content: userQuery }
+            ],
+        };
+
+        try {
+            const response = await fetch(TEXT_API_URL, {
+                method: 'POST',
+                headers: { 
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${apiKey}`
+                },
+                body: JSON.stringify(payload)
+            });
+
+            if (!response.ok) throw new Error("Study Plan API call failed.");
+
+            const result = await response.json();
+            const text = result.choices?.[0]?.message?.content;
+
+            if (text) {
+                setStudyPlan(text);
+            } else {
+                setStudyPlan("Could not generate the study plan. Please try again.");
+            }
+        } catch (error) {
+            console.error("Error generating study plan:", error);
+            setStudyPlan("An error occurred while fetching your study plan.");
+        } finally {
+            setIsLoadingPlan(false);
+        }
+    };
+
+
+    let message = '';
+    let encouragement = '';
+    let colorClass = '';
+
+    if (percentage === 100 && totalAttempts > 0) {
+        message = 'Perfect Score! 🌟';
+        encouragement = "You're a true U.S. knowledge expert!";
+        colorClass = 'text-green-600';
+    } else if (percentage >= 80) {
+        message = 'Excellent Work! 🇺🇸';
+        colorClass = 'text-indigo-600';
+        encouragement = "You really know your stuff about the USA!";
+    } else if (percentage >= 50) {
+        message = 'Good Effort! 👍';
+        colorClass = 'text-yellow-600';
+        encouragement = "You're on the right track. Keep learning!";
+    } else {
+        message = 'Keep Practicing! 💪';
+        colorClass = 'text-red-600';
+        encouragement = "Don't give up! Every quiz makes you smarter.";
+    }
+
+    return (
+        <div className= "bg-white rounded-xl shadow-2xl p-6 lg:p-10 max-w-2xl mx-auto text-center w-full" >
+        <h1 className="text-4xl font-extrabold text-gray-900 mb-2" > { message } < /h1>
+            < p className = "text-lg font-medium text-gray-600 mb-8" > { encouragement } < /p>
+
+                < div className = "my-8 p-6 rounded-xl border-4 border-dashed border-indigo-200 bg-indigo-50" >
+                    <p className="text-2xl font-semibold text-gray-700" > Your Final Score < /p>
+                        < div className = {`text-8xl font-black ${colorClass} my-2`
+}>
+    { percentage } %
+    </div>
+    < p className = "text-xl font-bold text-gray-700" >
+        You answered ** { score } ** out of ** { totalAttempts } ** questions correctly.
+                < /p>
+            < /div>
+
+{/* Study Plan Section */ }
+{
+    weakestCategory.category && (
+        <div className="mt-8 pt-6 border-t border-gray-200" >
+            <h3 className="text-2xl font-bold text-indigo-700 mb-4 flex justify-center items-center" >
+                <BookOpen className="w-6 h-6 mr-2" /> Targeted Study
+                    < /h3>
+                    < p className = "text-gray-600 mb-4" >
+                        Your weakest area appears to be ** { CATEGORY_INFO[weakestCategory.category].name } ** (scoring { weakestCategory.percentage }% on { weakestCategory.total } questions).
+    </p>
+
+    {
+        !studyPlan && (
+            <button
+                            onClick={ handleGenerateStudyPlan }
+        disabled = { isLoadingPlan }
+        className = "w-full py-3 px-6 bg-green-600 text-white text-lg font-bold rounded-lg shadow-lg hover:bg-green-700 transition transform hover:scale-[1.01] disabled:bg-green-400 flex items-center justify-center"
+            >
+        {
+            isLoadingPlan?(
+                                <> <RefreshCw className="w-5 h-5 mr-2 animate-spin" /> Generating Deep Dive...</>
+                            ) : (
+            <><Zap className= "w-5 h-5 mr-2" /> ✨ Generate Study Plan < />
+                            )
+    }
+    </button>
+                    )
+}
+
+{
+    studyPlan && (
+        <div className="mt-4 p-4 text-left border rounded-lg bg-white shadow-inner whitespace-pre-wrap text-gray-700" >
+            <p className="font-semibold text-lg mb-2" > Study Plan for { CATEGORY_INFO[weakestCategory.category].name }: </p>
+    { studyPlan }
+    </div>
+                    )
+}
+</div>
+            )}
+
+
+<div className="flex flex-col space-y-4 mt-8 pt-6 border-t border-gray-200" >
+    <button 
+                onClick={ onRetry }
+className = {`w-full py-3 px-6 bg-indigo-700 text-white text-lg font-bold rounded-lg shadow-lg hover:bg-indigo-600 transition transform hover:scale-[1.01]`}
+                >
+    <RefreshCw className="w-5 h-5 inline mr-2" /> Start a New Session
+        < /button>
+        < button
+onClick = { onHome }
+className = {`w-full py-3 px-6 bg-red-600 text-white text-lg font-bold rounded-lg shadow-lg hover:bg-red-500 transition transform hover:scale-[1.01]`}
+                >
+    <Landmark className="w-5 h-5 inline mr-2" /> Choose New Category
+        < /button>
+        < /div>
+        < /div>
+    );
+};
+
+// --- MAIN APPLICATION COMPONENT ---
+
+const App = () => {
+    const [gameState, setGameState] = useState('menu'); // 'menu', 'quiz', 'results'
+    const [selectedCategory, setSelectedCategory] = useState(null);
+    const [currentQuestionNumber, setCurrentQuestionNumber] = useState(0); // 1, 2, 3...
+    const [currentQuestion, setCurrentQuestion] = useState(null); // The actual question object
+    const [askedQuestionIds, setAskedQuestionIds] = useState([]); // IDs asked this session (for anti-repeat)
+    const [score, setScore] = useState(0);
+    // New state to track performance per category
+    const [categoryAttempts, setCategoryAttempts] = useState({});
+
+    // Tracks if the AudioContext has been successfully resumed/unlocked by a user gesture.
+    const [isAudioUnlocked, setIsAudioUnlocked] = useState(false);
+
+
+    // Helper for selecting the next question (handles category filtering and reset of pool)
+    const getNextQuestion = useCallback((category, currentAskedIds) => {
+        const categoryQuestions = QUIZ_DATA.filter(q => q.category === category);
+        let availableQuestions = categoryQuestions.filter(q => !currentAskedIds.includes(q.id));
+
+        let newAskedIds = currentAskedIds;
+
+        // If all questions in the category have been asked, reset the pool (for continuous play)
+        if (availableQuestions.length === 0 && categoryQuestions.length > 0) {
+            console.log(`[QUIZ TRACKER] Category ${category} pool exhausted. Resetting questions.`);
+            availableQuestions = categoryQuestions;
+            newAskedIds = []; // Prepare new state
+        }
+
+        console.log(`[QUIZ TRACKER] ${category}: Total questions: ${categoryQuestions.length}. Available questions: ${availableQuestions.length}. Asked IDs: ${newAskedIds.join(', ')}`);
+
+
+        if (availableQuestions.length === 0) {
+            return { question: null, newIds: [] };
+        }
+
+        const randomIndex = Math.floor(Math.random() * availableQuestions.length);
+        const question = availableQuestions[randomIndex];
+
+        // Return the question and the updated list of IDs including the newly selected one
+        return { question, newIds: [...newAskedIds, question.id] };
+    }, []);
+
+
+    // HANDLER: Handles category selection and starting the quiz, ensuring AudioContext resume.
+    const handleStartQuiz = (category) => {
+        // Attempt to resume AudioContext on the user click to fix NotAllowedError
+        if (audioContext.state === 'suspended') {
+            audioContext.resume().then(() => {
+                console.log("AudioContext resumed on user gesture.");
+                setIsAudioUnlocked(true);
+            }).catch(e => {
+                console.warn("Audio Context Resume Failed on user gesture:", e);
+                // Even if it fails, we mark it as 'unlocked' so React knows to proceed, 
+                // but audio may still be blocked by the browser.
+                setIsAudioUnlocked(true);
+            });
+        } else if (audioContext.state === 'running' || audioContext.state === 'closed') {
+            setIsAudioUnlocked(true);
+        }
+
+        // Start the rest of the quiz logic
+        setSelectedCategory(category);
+        setScore(0);
+        setCategoryAttempts({});
+
+        const { question: firstQuestion, newIds } = getNextQuestion(category, []);
+
+        if (firstQuestion) {
+            setCurrentQuestionNumber(1);
+            setCurrentQuestion(firstQuestion);
+            setAskedQuestionIds(newIds);
+            setGameState('quiz');
+        } else {
+            console.error("No questions found for category:", category);
+            setGameState('menu');
+        }
+    };
+
+
+    // Handles user's answer submission (updates score AND category performance)
+    const handleAnswerSubmission = useCallback((isCorrect, questionCategory) => {
+        if (isCorrect) {
+            setScore(prevScore => prevScore + 1);
+        }
+
+        // Update category performance tracker
+        setCategoryAttempts(prev => {
+            const current = prev[questionCategory] || { correct: 0, total: 0 };
+            return {
+                ...prev,
+                [questionCategory]: {
+                    correct: current.correct + (isCorrect ? 1 : 0),
+                    total: current.total + 1,
+                }
+            };
+        });
+    }, []);
+
+    // Handles explicit request to move to the next question
+    const handleNextQuestion = useCallback(() => {
+        const { question: nextQuestion, newIds } = getNextQuestion(selectedCategory, askedQuestionIds);
+
+        if (nextQuestion) {
+            setCurrentQuestionNumber(prevNum => prevNum + 1);
+            setCurrentQuestion(nextQuestion);
+            setAskedQuestionIds(newIds);
+        } else {
+            // End the quiz if no more questions can be found
+            handleEndQuiz();
+        }
+    }, [selectedCategory, askedQuestionIds, getNextQuestion]);
+
+    // Ends the quiz and moves to results screen
+    const handleEndQuiz = () => {
+        // The useTimer hook cleanup handles stopping the ticking sound interval
+        setGameState('results');
+    };
+
+    // Resets for the same category
+    const handleRetry = () => {
+        setScore(0);
+        setCurrentQuestionNumber(0);
+        setAskedQuestionIds([]);
+        setCategoryAttempts({});
+        handleStartQuiz(selectedCategory); // Uses the safe handler
+    };
+
+    // Returns to the home screen
+    const handleHome = () => {
+        // The useTimer hook cleanup handles stopping the ticking sound interval
+        setSelectedCategory(null);
+        setCurrentQuestion(null);
+        setCurrentQuestionNumber(0);
+        setAskedQuestionIds([]);
+        setCategoryAttempts({});
+        setIsAudioUnlocked(false);
+        setGameState('menu');
+    };
+
+
+    // --- RENDER LOGIC ---
+    let content;
+
+    if (gameState === 'menu') {
+        content = (
+            <div className= "max-w-4xl mx-auto p-4 md:p-8" >
+            <div className="text-center mb-12" >
+                <h2 className="text-4xl md:text-5xl font-extrabold mb-4 text-indigo-800" >
+                    U.S.Knowledge Challenge
+                        < /h2>
+                        < p className = "text-xl text-gray-600" >
+                            Select a category to begin your ** unlimited question ** quiz session!
+                                < /p>
+                                < /div>
+
+                                < div className = "grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6" >
+                                {
+                                    Object.entries(CATEGORY_INFO).map(([key, info]) => {
+                                        const Icon = info.icon;
+                                        return (
+                                            <div
+                                key= { key }
+                                        className = {`relative flex flex-col items-center justify-center p-6 text-white rounded-xl shadow-lg transform transition duration-300 cursor-pointer 
+                                    hover:scale-[1.03] active:scale-[0.98] ${info.color} hover:shadow-2xl hover:shadow-indigo-400/50`
+                                    }
+                                onClick = {() => handleStartQuiz(key)} // Using the safe handler
+                            >
+    <Icon className="w-10 h-10 mb-3" />
+        <h3 className="text-xl font-bold tracking-wide" > { info.name } < /h3>
+            < p className = "text-sm opacity-90 text-center mt-1" > { info.description } < /p>
+                < /div>
+                        );
+                    })}
+</div>
+    < /div>
+        );
+    } else if (gameState === 'quiz' && currentQuestion) {
+    content = (
+        <div className= "p-4 md:p-8 w-full" >
+        <QuizQuestion
+                    // Key changes every time to force a full component reset (timer, lock state, etc.)
+                    key={ currentQuestion.id + '-' + currentQuestionNumber }
+    question = { currentQuestion }
+    questionNumber = { currentQuestionNumber }
+    onAnswerSubmission = { handleAnswerSubmission }
+    onNext = { handleNextQuestion }
+    isAudioUnlocked = { isAudioUnlocked } // Passed the audio status
+        />
+        </div>
+        );
+} else if (gameState === 'results') {
+    // Total attempts is the number of questions that have been asked.
+    const totalAttempts = currentQuestionNumber - 1;
+    content = (
+        <div className= "p-4 md:p-8 w-full" >
+        <QuizResults
+                    score={ score }
+    totalAttempts = { totalAttempts }
+    categoryAttempts = { categoryAttempts }
+    onRetry = { handleRetry }
+    onHome = { handleHome }
+        />
+        </div>
+        );
+}
+
+const currentCategoryInfo = selectedCategory ? CATEGORY_INFO[selectedCategory] : null;
+
+return (
+    <div className= "min-h-screen bg-gray-100 flex flex-col font-sans" >
+    <style jsx="true" > {`
+                @keyframes pulse-once {
+                    0% { box-shadow: 0 0 0 0 rgba(76, 175, 80, 0.7); }
+                    50% { box-shadow: 0 0 20px 5px rgba(76, 175, 80, 0.7); }
+                    100% { box-shadow: 0 0 0 0 rgba(76, 175, 80, 0); }
+                }
+                .animate-pulse-once {
+                    animation: pulse-once 1s ease-out;
+                }
+                .animate-spin {
+                    animation: spin 1s linear infinite;
+                }
+                @keyframes spin {
+                    from { transform: rotate(0deg); }
+                    to { transform: rotate(360deg); }
+                }
+                .animate-pulse {
+                    animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+                }
+            `}</style>
+
+{/* Header */ }
+<header className={ `shadow-lg sticky top-0 z-10 bg-indigo-800` }>
+    <div className="container mx-auto px-4 py-4 flex justify-between items-center" >
+        <div className="flex items-center space-x-3 text-white" >
+            <img 
+                            src={ APP_ICON_URL }
+alt = "App Icon"
+className = "w-9 h-9 object-cover rounded-full border-2 border-white"
+onError = {(e) => { e.target.onerror = null; e.target.src = "https://placehold.co/150x150/9CA3AF/FFFFFF?text=Quiz"; }}
+style = {{ minWidth: '36px', minHeight: '36px' }}
+/>
+
+    <div>
+{/* Application name: QuizUS */ }
+<h1 className="text-2xl font-black tracking-wider" > QuizUS < /h1>
+{
+    currentCategoryInfo && (
+        <p className="text-xs opacity-80" > Category: { currentCategoryInfo.name } </p>
+                            )
+}
+</div>
+    < /div>
+
+    < div className = "flex items-center space-x-4" >
+        { gameState === 'quiz' && (
+            <>
+            <div className="text-white text-lg font-bold" >
+                Score: { score }
+</div>
+    < button
+onClick = { handleEndQuiz }
+className = {`py-2 px-4 bg-yellow-500 text-indigo-900 rounded-lg text-sm font-bold hover:bg-yellow-400 transition shadow-md flex items-center`}
+                                >
+    <StopCircle className="w-4 h-4 inline mr-2" /> Stop Quiz
+        < /button>
+        < />
+                        )}
+{
+    gameState !== 'menu' && (
+        <button 
+                                onClick={ handleHome }
+    className = {`py-2 px-4 bg-red-600 text-white rounded-lg text-sm font-medium hover:bg-red-500 transition shadow-md`
+}
+                            >
+    <RefreshCw className="w-4 h-4 inline mr-2" /> Change Category
+        < /button>
+                        )}
+</div>
+    < /div>
+    < /header>
+
+{/* Main Content */ }
+<main className="flex-grow py-12 flex items-center justify-center" >
+    { content }
+    < /main>
+
+{/* Footer */ }
+<footer className="border-t border-gray-300 bg-white shadow-inner" >
+    <div className="container mx-auto px-4 py-3 text-center text-sm text-gray-500" >
+        <p>Powered by React, Web Audio API(for sounds), and Grok AI (xAI) for grounded fun facts and study plans. 🇺🇸</p>
+            < /div>
+            < /footer>
+            < /div>
+    );
+};
+
+export default App;
